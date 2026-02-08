@@ -1,0 +1,631 @@
+"""
+Azure Purview Data Extraction Script - Two-Step Bulk API Approach
+==================================================================
+
+This script extracts metadata from Azure Purview using a two-step process:
+
+STEP 1: Fetch Table Entities
+    - Search for entities by type (azure_datalake_gen2_resource_set, azure_synapse_dedicated_sql_table)
+    - Get entity IDs from search results
+    - Call bulk API with entity IDs to fetch table metadata
+
+STEP 2: Extract Schema GUIDs
+    - From the table entity response, extract GUIDs from:
+      entities -> relationshipAttributes -> attachedSchema -> guid
+    - These GUIDs represent column/schema entities
+
+STEP 3: Fetch Column Entities
+    - Call bulk API again with schema GUIDs
+    - Fetch column-level metadata (name, data type, description)
+
+STEP 4: Combine and Extract
+    - Merge table metadata with column metadata
+    - Create DataFrame with 13 required fields
+    - Write to Azure Data Lake Storage
+
+Output Fields:
+1. table_asset_id - Table GUID from entities.guid
+2. column_guid - Column GUID from schema entities.guid
+3. collectionId - From entities.collectionId
+4. entity_type - From entities.relationshipAttributes.relatedDataSets.typeName
+5. col_name - From schema entities.attributes.name
+6. data_type - From schema entities.attributes.type
+7. desc - From schema entities.attributes.userDescription
+8. qName - From schema entities.attributes.qualifiedName
+9. classification - From entities.classifications.typeName
+10. createTime - From entities.createTime
+11. updateTime - From entities.updateTime
+12. entityStatus - From entities.status
+13. lastModifiedTS - From entities.lastModifiedTS
+
+Features:
+- Handles pagination in search results
+- Processes entities in batches (100 per batch)
+- Processes schemas in sub-batches (100 per batch)
+- Rate limiting to avoid API throttling
+- Comprehensive error handling
+- Uploads final CSV to Azure Data Lake Storage
+"""
+
+import requests
+import pandas as pd
+from msal import ConfidentialClientApplication
+import json
+from typing import List, Dict, Any
+import time
+from azure.storage.filedatalake import DataLakeServiceClient
+from datetime import datetime
+
+# Configuration
+ACCOUNT_NAME = "your-purview-account"
+TENANT_ID = "your-tenant-id"
+CLIENT_ID = "your-client-id"
+CLIENT_SECRET = "your-client-secret"
+
+# ADLS Configuration
+ADLS_ACCOUNT_NAME = "your-adls-account"
+ADLS_FILE_SYSTEM = "your-container"
+ADLS_PATH = "purview-extract/data.csv"
+
+# Entity types to search for
+ENTITY_TYPES = [
+    "azure_datalake_gen2_resource_set",
+    "azure_synapse_dedicated_sql_table"
+]
+
+# Collection Filter (set to None to search all collections, or provide specific collection ID)
+COLLECTION_ID = None  # e.g., "your-collection-id" or None for all collections
+
+# Processing Configuration
+MAX_ENTITIES = 2000  # Limit total entities for testing (set to None for no limit)
+BATCH_SIZE = 100  # Number of entities to process per batch
+
+
+class AzurePurviewExtractor:
+    """Extract metadata from Azure Purview API"""
+    
+    def __init__(self, account_name: str, tenant_id: str, client_id: str, client_secret: str):
+        self.account_name = account_name
+        self.tenant_id = tenant_id
+        self.client_id = client_id
+        self.client_secret = client_secret
+        self.access_token = None
+        self.base_url = f"https://{account_name}.purview.azure.com"
+        
+    def get_access_token(self) -> str:
+        """Authenticate using MSAL and get access token"""
+        authority = f"https://login.microsoftonline.com/{self.tenant_id}"
+        scope = ["https://purview.azure.net/.default"]
+        
+        app = ConfidentialClientApplication(
+            client_id=self.client_id,
+            client_credential=self.client_secret,
+            authority=authority
+        )
+        
+        result = app.acquire_token_for_client(scopes=scope)
+        
+        if "access_token" in result:
+            self.access_token = result["access_token"]
+            print("Successfully authenticated with Azure Purview")
+            return self.access_token
+        else:
+            raise Exception(f"Authentication failed: {result.get('error_description', 'Unknown error')}")
+    
+    def search_entities(self, entity_type: str, limit: int = 1000, max_results: int = None) -> List[str]:
+        """
+        Search for entities by type and return their IDs with pagination
+        
+        Args:
+            entity_type: Type of entity to search for
+            limit: Number of results per page (max 1000)
+            max_results: Maximum total results to return (for testing)
+        """
+        url = f"{self.base_url}/catalog/api/search/query?api-version=2022-08-01-preview"
+        headers = {
+            "Authorization": f"Bearer {self.access_token}",
+            "Content-Type": "application/json"
+        }
+        
+        all_entity_ids = []
+        offset = 0
+        
+        while True:
+            # Stop if we've reached max_results
+            if max_results and len(all_entity_ids) >= max_results:
+                print(f"Reached max_results limit of {max_results}")
+                break
+            
+            # Build filter with entity type and optional collection ID
+            search_filter = {"entityType": entity_type}
+            
+            if COLLECTION_ID:
+                search_filter["collectionId"] = COLLECTION_ID
+            
+            payload = {
+                "keywords": "*",
+                "filter": search_filter,
+                "limit": limit,
+                "offset": offset
+            }
+            
+            print(f"Searching for {entity_type} entities (offset: {offset})...")
+            response = requests.post(url, headers=headers, json=payload)
+            
+            if response.status_code != 200:
+                print(f"Search failed: {response.status_code} - {response.text}")
+                break
+            
+            data = response.json()
+            results = data.get("value", [])
+            
+            if not results:
+                print(f"No more results for {entity_type}")
+                break
+            
+            # Extract IDs from search results
+            entity_ids = [entity.get("id") for entity in results if entity.get("id")]
+            
+            # Add only up to max_results
+            if max_results:
+                remaining = max_results - len(all_entity_ids)
+                entity_ids = entity_ids[:remaining]
+            
+            all_entity_ids.extend(entity_ids)
+            
+            print(f"Found {len(entity_ids)} entities in this batch (total: {len(all_entity_ids)})")
+            
+            # Stop if we've reached max_results
+            if max_results and len(all_entity_ids) >= max_results:
+                print(f"Reached max_results limit of {max_results}")
+                break
+            
+            # Check if there are more results
+            total_count = data.get("@search.count", 0)
+            if offset + limit >= total_count:
+                break
+            
+            offset += limit
+            time.sleep(0.5)  # Rate limiting
+        
+        return all_entity_ids
+    
+    def get_entity_bulk(self, entity_ids: List[str]) -> Dict[str, Any]:
+        """
+        Fetch entity details in bulk using the bulk API
+        """
+        url = f"{self.base_url}/catalog/api/atlas/v2/entity/bulk"
+        headers = {
+            "Authorization": f"Bearer {self.access_token}",
+            "Content-Type": "application/json"
+        }
+        
+        params = {
+            "guid": entity_ids,
+            "ignoreRelationships": False,
+            "minExtInfo": False
+        }
+        
+        response = requests.get(url, headers=headers, params=params)
+        
+        if response.status_code != 200:
+            raise Exception(f"Bulk API failed: {response.status_code} - {response.text}")
+        
+        return response.json()
+    
+    def get_schema_bulk(self, schema_guids: List[str]) -> Dict[str, Any]:
+        """
+        Fetch schema/column details in bulk using the bulk API
+        """
+        url = f"{self.base_url}/catalog/api/atlas/v2/entity/bulk"
+        headers = {
+            "Authorization": f"Bearer {self.access_token}",
+            "Content-Type": "application/json"
+        }
+        
+        params = {
+            "guid": schema_guids,
+            "ignoreRelationships": False,
+            "minExtInfo": False
+        }
+        
+        response = requests.get(url, headers=headers, params=params)
+        
+        if response.status_code != 200:
+            raise Exception(f"Schema Bulk API failed: {response.status_code} - {response.text}")
+        
+        return response.json()
+    
+    def extract_schema_guids_with_mapping(self, entity_bulk_response: Dict[str, Any]) -> Dict[str, str]:
+        """
+        Extract GUIDs from entities->relationshipAttributes->attachedSchema
+        and create a mapping of schema_guid -> table_guid
+        
+        Returns:
+            Dict mapping schema_guid to parent table_guid
+        """
+        schema_to_table_map = {}
+        entities = entity_bulk_response.get("entities", [])
+        
+        for entity in entities:
+            table_guid = entity.get("guid")
+            relationship_attrs = entity.get("relationshipAttributes", {})
+            attached_schema = relationship_attrs.get("attachedSchema", [])
+            
+            # Handle both list and single object
+            if isinstance(attached_schema, list):
+                for schema in attached_schema:
+                    if isinstance(schema, dict) and "guid" in schema:
+                        schema_guid = schema["guid"]
+                        schema_to_table_map[schema_guid] = table_guid
+            elif isinstance(attached_schema, dict) and "guid" in attached_schema:
+                schema_guid = attached_schema["guid"]
+                schema_to_table_map[schema_guid] = table_guid
+        
+        return schema_to_table_map
+    
+    def extract_metadata(self, entity_bulk_response: Dict[str, Any], 
+                         schema_bulk_response: Dict[str, Any],
+                         schema_to_table_map: Dict[str, str]) -> List[Dict[str, Any]]:
+        """
+        Extract required fields from entity and schema bulk API responses
+        
+        Args:
+            entity_bulk_response: Response from bulk API with table entities
+            schema_bulk_response: Response from bulk API with schema/column entities
+            schema_to_table_map: Mapping of schema_guid -> table_guid
+        """
+        extracted_data = []
+        
+        # Build table metadata lookup
+        table_metadata = {}
+        entities = entity_bulk_response.get("entities", [])
+        
+        for entity in entities:
+            table_guid = entity.get("guid")
+            collection_id = entity.get("collectionId")
+            create_time = entity.get("createTime")
+            update_time = entity.get("updateTime")
+            entity_status = entity.get("status")
+            last_modified_ts = entity.get("lastModifiedTS")
+            
+            # Get entity_type directly from the entity's typeName
+            # This will be "azure_datalake_gen2_resource_set" or "azure_synapse_dedicated_sql_table"
+            entity_type = entity.get("typeName")
+            
+            # Extract classifications
+            classifications = entity.get("classifications", [])
+            classification_names = [c.get("typeName") for c in classifications if c.get("typeName")]
+            classification_str = ", ".join(classification_names) if classification_names else None
+            
+            # Store table metadata
+            table_metadata[table_guid] = {
+                "collectionId": collection_id,
+                "entity_type": entity_type,
+                "classification": classification_str,
+                "createTime": create_time,
+                "updateTime": update_time,
+                "entityStatus": entity_status,
+                "lastModifiedTS": last_modified_ts
+            }
+        
+        # Process schema/column entities
+        schema_entities = schema_bulk_response.get("entities", [])
+        referred_entities = schema_bulk_response.get("referredEntities", {})
+        
+        # Debug: Show first mapping to verify correctness
+        if schema_entities and schema_to_table_map:
+            first_column_guid = schema_entities[0].get("guid")
+            first_table_guid = schema_to_table_map.get(first_column_guid)
+            print(f"  [DEBUG] Sample mapping: column_guid={first_column_guid[:8]}... -> table_guid={first_table_guid[:8] if first_table_guid else 'None'}...")
+        
+        # First, try to get column data from entities array
+        for schema_entity in schema_entities:
+            column_guid = schema_entity.get("guid")
+            
+            # Get column details from the entity itself
+            attributes = schema_entity.get("attributes", {})
+            col_name = attributes.get("name")
+            data_type = attributes.get("type") or attributes.get("data_type") or attributes.get("dataType")
+            user_description = attributes.get("userDescription")
+            q_name = attributes.get("qualifiedName")
+            
+            # If column details are empty, try referredEntities
+            if not col_name and column_guid in referred_entities:
+                referred_entity = referred_entities[column_guid]
+                referred_attrs = referred_entity.get("attributes", {})
+                col_name = referred_attrs.get("name")
+                data_type = referred_attrs.get("type") or referred_attrs.get("data_type") or referred_attrs.get("dataType")
+                user_description = referred_attrs.get("userDescription")
+                q_name = referred_attrs.get("qualifiedName")
+            
+            # Get parent table GUID from our mapping
+            table_guid = schema_to_table_map.get(column_guid)
+            
+            # Get table metadata
+            if table_guid and table_guid in table_metadata:
+                table_info = table_metadata[table_guid]
+            else:
+                # If we don't have the table in our metadata, create empty values
+                table_info = {
+                    "collectionId": None,
+                    "entity_type": None,
+                    "classification": None,
+                    "createTime": None,
+                    "updateTime": None,
+                    "entityStatus": None,
+                    "lastModifiedTS": None
+                }
+            
+            # Create record with CORRECT field mapping
+            record = {
+                "table_asset_id": table_guid,  # This should be TABLE guid
+                "column_guid": column_guid,     # This should be COLUMN guid
+                "collectionId": table_info["collectionId"],
+                "entity_type": table_info["entity_type"],
+                "col_name": col_name,
+                "data_type": data_type,
+                "desc": user_description,
+                "qName": q_name,
+                "classification": table_info["classification"],
+                "createTime": table_info["createTime"],
+                "updateTime": table_info["updateTime"],
+                "entityStatus": table_info["entityStatus"],
+                "lastModifiedTS": table_info["lastModifiedTS"]
+            }
+            
+            extracted_data.append(record)
+        
+        # If no schema entities were found, create records for tables without columns
+        if not schema_entities:
+            for table_guid, table_info in table_metadata.items():
+                record = {
+                    "table_asset_id": table_guid,
+                    "column_guid": None,
+                    "collectionId": table_info["collectionId"],
+                    "entity_type": table_info["entity_type"],
+                    "col_name": None,
+                    "data_type": None,
+                    "desc": None,
+                    "qName": None,
+                    "classification": table_info["classification"],
+                    "createTime": table_info["createTime"],
+                    "updateTime": table_info["updateTime"],
+                    "entityStatus": table_info["entityStatus"],
+                    "lastModifiedTS": table_info["lastModifiedTS"]
+                }
+                extracted_data.append(record)
+        
+        return extracted_data
+    
+    def process_in_batches(self, entity_ids: List[str], batch_size: int = 100) -> pd.DataFrame:
+        """
+        Process entity IDs in batches with two-step bulk API approach:
+        1. Fetch entity details (tables)
+        2. Extract schema GUIDs from attachedSchema with table mapping
+        3. Fetch schema details (columns)
+        4. Extract and combine metadata using the mapping
+        """
+        all_data = []
+        total_batches = (len(entity_ids) + batch_size - 1) // batch_size
+        
+        for i in range(0, len(entity_ids), batch_size):
+            batch = entity_ids[i:i + batch_size]
+            batch_num = (i // batch_size) + 1
+            
+            print(f"Processing batch {batch_num}/{total_batches} ({len(batch)} entities)...")
+            
+            try:
+                # Step 1: Get entity details (tables)
+                print(f"  Step 1: Fetching entity details...")
+                entity_bulk_response = self.get_entity_bulk(batch)
+                
+                # Step 2: Extract schema GUIDs and create table->column mapping
+                print(f"  Step 2: Extracting schema GUIDs from attachedSchema...")
+                schema_to_table_map = self.extract_schema_guids_with_mapping(entity_bulk_response)
+                schema_guids = list(schema_to_table_map.keys())
+                
+                if schema_guids:
+                    print(f"  Found {len(schema_guids)} schema GUIDs")
+                    
+                    # Step 3: Fetch schema details in sub-batches if needed
+                    schema_batch_size = 100
+                    schema_bulk_response = {"entities": [], "referredEntities": {}}
+                    
+                    for j in range(0, len(schema_guids), schema_batch_size):
+                        schema_batch = schema_guids[j:j + schema_batch_size]
+                        print(f"  Step 3: Fetching schema details ({j+1}-{min(j+schema_batch_size, len(schema_guids))} of {len(schema_guids)})...")
+                        
+                        schema_response = self.get_schema_bulk(schema_batch)
+                        
+                        # Merge schema responses
+                        schema_bulk_response["entities"].extend(schema_response.get("entities", []))
+                        schema_bulk_response["referredEntities"].update(schema_response.get("referredEntities", {}))
+                        
+                        time.sleep(0.3)  # Rate limiting for sub-batches
+                    
+                    # Step 4: Extract metadata combining entity and schema data with mapping
+                    print(f"  Step 4: Extracting metadata...")
+                    batch_data = self.extract_metadata(entity_bulk_response, schema_bulk_response, schema_to_table_map)
+                    all_data.extend(batch_data)
+                    
+                    print(f"  ✓ Extracted {len(batch_data)} records from batch {batch_num}")
+                else:
+                    print(f"  No schema GUIDs found for this batch")
+                    # Still extract table-level data
+                    empty_schema_response = {"entities": [], "referredEntities": {}}
+                    empty_mapping = {}
+                    batch_data = self.extract_metadata(entity_bulk_response, empty_schema_response, empty_mapping)
+                    all_data.extend(batch_data)
+                    print(f"  ✓ Extracted {len(batch_data)} table records (no columns)")
+                
+            except Exception as e:
+                print(f"  ✗ Error processing batch {batch_num}: {str(e)}")
+                import traceback
+                traceback.print_exc()
+                continue
+            
+            time.sleep(0.5)  # Rate limiting between main batches
+        
+        return pd.DataFrame(all_data)
+    
+    def run_extraction(self) -> pd.DataFrame:
+        """
+        Main extraction workflow
+        """
+        # Authenticate
+        self.get_access_token()
+        
+        # Show filter configuration
+        if COLLECTION_ID:
+            print(f"Collection Filter: {COLLECTION_ID}")
+        else:
+            print("Collection Filter: None (searching all collections)")
+        
+        # Search for entities of specified types
+        all_entity_ids = []
+        remaining_limit = MAX_ENTITIES if MAX_ENTITIES else None
+        
+        for entity_type in ENTITY_TYPES:
+            # Calculate how many more entities we can search for
+            if remaining_limit is not None:
+                search_limit = remaining_limit
+                if search_limit <= 0:
+                    print(f"Reached MAX_ENTITIES limit, skipping remaining entity types")
+                    break
+            else:
+                search_limit = None
+            
+            entity_ids = self.search_entities(entity_type, max_results=search_limit)
+            print(f"Found {len(entity_ids)} entities of type {entity_type}")
+            all_entity_ids.extend(entity_ids)
+            
+            # Update remaining limit
+            if remaining_limit is not None:
+                remaining_limit -= len(entity_ids)
+        
+        print(f"\nTotal entities found: {len(all_entity_ids)}")
+        
+        if MAX_ENTITIES and len(all_entity_ids) > 0:
+            print(f"Entity limit: {MAX_ENTITIES} (set MAX_ENTITIES=None for unlimited)")
+        
+        if not all_entity_ids:
+            print("No entities found. Exiting.")
+            return pd.DataFrame()
+        
+        # Process entities in batches
+        df = self.process_in_batches(all_entity_ids, batch_size=BATCH_SIZE)
+        
+        print(f"\nExtraction complete. Total records: {len(df)}")
+        return df
+
+
+def upload_to_adls(df: pd.DataFrame, account_name: str, file_system: str, 
+                   file_path: str, client_id: str, client_secret: str, tenant_id: str):
+    """
+    Upload DataFrame to Azure Data Lake Storage
+    """
+    try:
+        # Create credentials
+        authority = f"https://login.microsoftonline.com/{tenant_id}"
+        scope = ["https://storage.azure.com/.default"]
+        
+        app = ConfidentialClientApplication(
+            client_id=client_id,
+            client_credential=client_secret,
+            authority=authority
+        )
+        
+        result = app.acquire_token_for_client(scopes=scope)
+        
+        if "access_token" not in result:
+            raise Exception(f"ADLS Authentication failed: {result.get('error_description')}")
+        
+        token = result["access_token"]
+        
+        # Create DataLakeServiceClient
+        service_client = DataLakeServiceClient(
+            account_url=f"https://{account_name}.dfs.core.windows.net",
+            credential=token
+        )
+        
+        file_system_client = service_client.get_file_system_client(file_system=file_system)
+        file_client = file_system_client.get_file_client(file_path)
+        
+        # Convert DataFrame to CSV
+        csv_data = df.to_csv(index=False)
+        
+        # Upload file
+        print(f"Uploading to ADLS: {account_name}/{file_system}/{file_path}")
+        file_client.upload_data(csv_data, overwrite=True)
+        
+        print("Upload successful!")
+        
+    except Exception as e:
+        print(f"Error uploading to ADLS: {str(e)}")
+        raise
+
+
+def main():
+    """
+    Main execution function
+    """
+    print("=" * 80)
+    print("Azure Purview Data Extraction")
+    print("=" * 80)
+    print(f"Start Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+    
+    # Initialize extractor
+    extractor = AzurePurviewExtractor(
+        account_name=ACCOUNT_NAME,
+        tenant_id=TENANT_ID,
+        client_id=CLIENT_ID,
+        client_secret=CLIENT_SECRET
+    )
+    
+    # Run extraction
+    df = extractor.run_extraction()
+    
+    if df.empty:
+        print("No data extracted. Exiting.")
+        return
+    
+    # Display summary
+    print("\n" + "=" * 80)
+    print("DATA SUMMARY")
+    print("=" * 80)
+    print(f"Total Records: {len(df)}")
+    print(f"Columns: {', '.join(df.columns)}")
+    print(f"\nFirst 5 rows:")
+    print(df.head())
+    print(f"\nData types:")
+    print(df.dtypes)
+    
+    # Save locally first
+    local_file = f"purview_extract_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+    df.to_csv(local_file, index=False)
+    print(f"\nData saved locally: {local_file}")
+    
+    # Upload to ADLS
+    print("\n" + "=" * 80)
+    print("Uploading to Azure Data Lake Storage")
+    print("=" * 80)
+    
+    upload_to_adls(
+        df=df,
+        account_name=ADLS_ACCOUNT_NAME,
+        file_system=ADLS_FILE_SYSTEM,
+        file_path=ADLS_PATH,
+        client_id=CLIENT_ID,
+        client_secret=CLIENT_SECRET,
+        tenant_id=TENANT_ID
+    )
+    
+    print("\n" + "=" * 80)
+    print(f"End Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print("Process completed successfully!")
+    print("=" * 80)
+
+
+if __name__ == "__main__":
+    main()
