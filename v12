@@ -1,0 +1,678 @@
+"""
+Azure Purview Data Extractor - Fixed Endpoints
+Connects to Azure Purview API using MSAL authentication,
+retrieves asset and column metadata, and writes to Azure ADLS.
+"""
+
+import requests
+import pandas as pd
+from msal import ConfidentialClientApplication
+from azure.storage.filedatalake import DataLakeServiceClient
+from datetime import datetime
+import json
+import re
+from typing import List, Dict, Any, Optional
+import logging
+import time
+
+# Configure logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+
+class AzurePurviewExtractor:
+    """Class to handle Azure Purview API interactions and data extraction."""
+    
+    def __init__(self, account_name: str, tenant_id: str, client_id: str, client_secret: str, debug: bool = False):
+        """
+        Initialize the Purview extractor with authentication credentials.
+        
+        Args:
+            account_name: Azure Purview account name
+            tenant_id: Azure AD tenant ID
+            client_id: Service principal client ID
+            client_secret: Service principal client secret
+            debug: Enable debug mode for detailed logging
+        """
+        self.account_name = account_name
+        self.tenant_id = tenant_id
+        self.client_id = client_id
+        self.client_secret = client_secret
+        
+        # Different endpoint formats to try
+        self.endpoint_base = f"https://{account_name}.purview.azure.com"
+        self.catalog_endpoint = f"https://{account_name}.catalog.purview.azure.com"
+        self.scan_endpoint = f"https://{account_name}.scan.purview.azure.com"
+        
+        self.access_token = None
+        self.debug = debug
+        
+        if self.debug:
+            logger.setLevel(logging.DEBUG)
+        
+    def authenticate(self) -> str:
+        """
+        Authenticate using MSAL and get access token.
+        
+        Returns:
+            Access token string
+        """
+        logger.info("Authenticating with Azure AD...")
+        
+        authority = f"https://login.microsoftonline.com/{self.tenant_id}"
+        scope = ["https://purview.azure.net/.default"]
+        
+        try:
+            app = ConfidentialClientApplication(
+                client_id=self.client_id,
+                client_credential=self.client_secret,
+                authority=authority
+            )
+            
+            result = app.acquire_token_for_client(scopes=scope)
+            
+            if "access_token" in result:
+                self.access_token = result["access_token"]
+                logger.info("✓ Authentication successful")
+                return self.access_token
+            else:
+                error_msg = result.get("error_description", result.get("error"))
+                raise Exception(f"Authentication failed: {error_msg}")
+        except Exception as e:
+            logger.error(f"Exception during authentication: {str(e)}")
+            raise
+    
+    def get_headers(self) -> Dict[str, str]:
+        """Get HTTP headers with authentication token."""
+        if not self.access_token:
+            self.authenticate()
+        
+        return {
+            "Authorization": f"Bearer {self.access_token}",
+            "Content-Type": "application/json"
+        }
+    
+    def test_endpoints(self) -> Dict[str, bool]:
+        """
+        Test different API endpoints to find working ones.
+        
+        Returns:
+            Dictionary of endpoint types and their status
+        """
+        logger.info("Testing Purview API endpoints...")
+        
+        results = {}
+        
+        # Test different endpoint combinations
+        test_cases = [
+            # Search endpoints
+            ("search_v1", f"{self.endpoint_base}/catalog/api/search/query", "POST"),
+            ("search_v2", f"{self.catalog_endpoint}/api/search/query", "POST"),
+            
+            # Atlas entity endpoints
+            ("atlas_v1", f"{self.endpoint_base}/catalog/api/atlas/v2/types/typedefs", "GET"),
+            ("atlas_v2", f"{self.catalog_endpoint}/api/atlas/v2/types/typedefs", "GET"),
+            
+            # Basic search endpoint
+            ("basic_search", f"{self.endpoint_base}/catalog/api/atlas/v2/search/basic", "POST"),
+            ("basic_search_v2", f"{self.catalog_endpoint}/api/atlas/v2/search/basic", "POST"),
+        ]
+        
+        for name, url, method in test_cases:
+            try:
+                logger.info(f"Testing {name}: {url}")
+                
+                if method == "GET":
+                    response = requests.get(url, headers=self.get_headers(), timeout=10)
+                else:
+                    # Simple test payload
+                    payload = {"keywords": "*", "limit": 1}
+                    response = requests.post(url, headers=self.get_headers(), json=payload, timeout=10)
+                
+                status = response.status_code
+                logger.info(f"  Status: {status}")
+                
+                if status in [200, 201]:
+                    results[name] = True
+                    logger.info(f"  ✓ {name} is working!")
+                else:
+                    results[name] = False
+                    if self.debug:
+                        logger.debug(f"  Response: {response.text[:200]}")
+            except Exception as e:
+                results[name] = False
+                logger.warning(f"  Failed: {str(e)}")
+        
+        # Summary
+        working = [k for k, v in results.items() if v]
+        logger.info(f"\nWorking endpoints: {working if working else 'None found'}")
+        
+        return results
+    
+    def search_entities_atlas_basic(self, entity_types: List[str] = None, limit: int = 1000) -> List[Dict]:
+        """
+        Search using Atlas basic search API.
+        
+        Args:
+            entity_types: List of entity types to filter
+            limit: Number of results per page
+            
+        Returns:
+            List of all entities retrieved
+        """
+        if entity_types is None:
+            entity_types = [
+                "azure_datalake_gen2_resource_set",
+                "azure_synapse_dedicated_sql_table"
+            ]
+        
+        logger.info(f"Using Atlas Basic Search for types: {entity_types}")
+        
+        all_entities = []
+        
+        # Try different endpoint combinations
+        search_urls = [
+            f"{self.endpoint_base}/catalog/api/atlas/v2/search/basic",
+            f"{self.catalog_endpoint}/api/atlas/v2/search/basic"
+        ]
+        
+        working_url = None
+        
+        # Find working endpoint
+        for url in search_urls:
+            try:
+                test_payload = {
+                    "typeName": entity_types[0],
+                    "limit": 10,
+                    "offset": 0
+                }
+                response = requests.post(url, headers=self.get_headers(), json=test_payload, timeout=30)
+                
+                if response.status_code == 200:
+                    working_url = url
+                    logger.info(f"✓ Using endpoint: {url}")
+                    break
+                else:
+                    logger.debug(f"Endpoint {url} returned {response.status_code}")
+            except Exception as e:
+                logger.debug(f"Failed {url}: {str(e)}")
+        
+        if not working_url:
+            raise Exception("Could not find working Atlas basic search endpoint")
+        
+        # Search for each entity type
+        for entity_type in entity_types:
+            logger.info(f"Searching for entity type: {entity_type}")
+            offset = 0
+            
+            while True:
+                payload = {
+                    "typeName": entity_type,
+                    "excludeDeletedEntities": True,
+                    "limit": limit,
+                    "offset": offset
+                }
+                
+                try:
+                    response = requests.post(
+                        working_url,
+                        headers=self.get_headers(),
+                        json=payload,
+                        timeout=60
+                    )
+                    
+                    if response.status_code != 200:
+                        logger.error(f"Search failed: {response.status_code} - {response.text}")
+                        break
+                    
+                    data = response.json()
+                    entities = data.get("entities", [])
+                    
+                    if not entities:
+                        logger.info(f"No more entities for {entity_type}")
+                        break
+                    
+                    all_entities.extend(entities)
+                    logger.info(f"Retrieved {len(entities)} entities for {entity_type}. Total: {len(all_entities)}")
+                    
+                    # Check if more pages exist
+                    if len(entities) < limit:
+                        break
+                    
+                    offset += limit
+                    time.sleep(0.5)
+                    
+                except Exception as e:
+                    logger.error(f"Error during search: {str(e)}")
+                    break
+        
+        logger.info(f"Total entities retrieved: {len(all_entities)}")
+        return all_entities
+    
+    def search_entities_query_api(self, entity_types: List[str] = None, limit: int = 1000) -> List[Dict]:
+        """
+        Search using query API (if available).
+        
+        Args:
+            entity_types: List of entity types to filter
+            limit: Number of results per page
+            
+        Returns:
+            List of all entities retrieved
+        """
+        if entity_types is None:
+            entity_types = [
+                "azure_datalake_gen2_resource_set",
+                "azure_synapse_dedicated_sql_table"
+            ]
+        
+        logger.info(f"Trying Query API for types: {entity_types}")
+        
+        # Try different search query endpoints (some Purview instances use different paths)
+        search_urls = [
+            f"{self.catalog_endpoint}/api/search/query",  # Catalog subdomain without /catalog prefix
+            f"{self.endpoint_base}/datamap/api/search/query",  # DataMap API
+        ]
+        
+        all_entities = []
+        working_url = None
+        
+        # Find working endpoint
+        for url in search_urls:
+            try:
+                test_payload = {
+                    "keywords": "*",
+                    "limit": 10
+                }
+                logger.info(f"Trying: {url}")
+                response = requests.post(url, headers=self.get_headers(), json=test_payload, timeout=30)
+                
+                logger.info(f"Status: {response.status_code}")
+                
+                if response.status_code == 200:
+                    working_url = url
+                    logger.info(f"✓ Using query endpoint: {url}")
+                    break
+                else:
+                    if self.debug:
+                        logger.debug(f"Response: {response.text[:200]}")
+            except Exception as e:
+                logger.debug(f"Failed {url}: {str(e)}")
+        
+        if not working_url:
+            logger.warning("Query API not available, will use Atlas basic search")
+            return []
+        
+        # Perform search with pagination
+        offset = 0
+        while True:
+            search_payload = {
+                "keywords": "*",
+                "filter": {
+                    "entityType": entity_types
+                },
+                "limit": limit,
+                "offset": offset
+            }
+            
+            try:
+                response = requests.post(
+                    working_url,
+                    headers=self.get_headers(),
+                    json=search_payload,
+                    timeout=60
+                )
+                
+                if response.status_code != 200:
+                    logger.error(f"Search failed: {response.status_code}")
+                    break
+                
+                data = response.json()
+                entities = data.get("value", [])
+                
+                if not entities:
+                    break
+                
+                all_entities.extend(entities)
+                logger.info(f"Retrieved {len(entities)} entities. Total: {len(all_entities)}")
+                
+                if len(entities) < limit:
+                    break
+                
+                offset += limit
+                time.sleep(0.5)
+                
+            except Exception as e:
+                logger.error(f"Error: {str(e)}")
+                break
+        
+        return all_entities
+    
+    def get_entity_details(self, guid: str) -> Optional[Dict]:
+        """
+        Get detailed entity information including columns.
+        
+        Args:
+            guid: Entity GUID
+            
+        Returns:
+            Entity details dictionary
+        """
+        # Try different entity endpoints
+        entity_urls = [
+            f"{self.endpoint_base}/catalog/api/atlas/v2/entity/guid/{guid}",
+            f"{self.catalog_endpoint}/api/atlas/v2/entity/guid/{guid}"
+        ]
+        
+        for url in entity_urls:
+            try:
+                response = requests.get(url, headers=self.get_headers(), timeout=30)
+                
+                if response.status_code == 200:
+                    return response.json()
+                elif response.status_code == 404:
+                    return None
+            except Exception as e:
+                continue
+        
+        logger.warning(f"Could not retrieve entity {guid}")
+        return None
+    
+    def parse_app_id_from_qname(self, qname: str) -> str:
+        """Parse app_id from qualifiedName."""
+        if not qname:
+            return None
+        
+        patterns = [
+            r'https?://([^./]+)\.dfs\.core\.windows\.net',
+            r'https?://([^./]+)\.blob\.core\.windows\.net',
+            r'mssql://([^./]+)\.',
+            r'https?://([^./]+)',
+            r'^([^./]+)',
+        ]
+        
+        for pattern in patterns:
+            match = re.search(pattern, qname)
+            if match:
+                return match.group(1)
+        
+        return None
+    
+    def extract_datasource_info(self, entity: Dict, entity_type: str) -> Dict:
+        """Extract datasource name and schema name based on entity type."""
+        attributes = entity.get("attributes", {})
+        qname = attributes.get("qualifiedName", "")
+        
+        datasource_name = None
+        schema_name = None
+        
+        if "azure_datalake_gen2" in entity_type.lower():
+            datasource_name = (attributes.get("accountName") or 
+                              attributes.get("account") or 
+                              self.parse_account_from_qname(qname))
+            schema_name = (attributes.get("containerName") or 
+                          attributes.get("container") or
+                          attributes.get("filesystem"))
+        
+        elif "synapse" in entity_type.lower() or "sql" in entity_type.lower():
+            datasource_name = (attributes.get("database") or 
+                              attributes.get("databaseName") or
+                              attributes.get("db"))
+            schema_name = (attributes.get("schema") or 
+                          attributes.get("schemaName"))
+        
+        return {
+            "datasource_name": datasource_name,
+            "schema_name": schema_name
+        }
+    
+    def parse_account_from_qname(self, qname: str) -> str:
+        """Parse account name from qualified name."""
+        if not qname:
+            return None
+        
+        patterns = [
+            r'https?://([^.]+)\.dfs\.core\.windows\.net',
+            r'https?://([^.]+)\.blob\.core\.windows\.net',
+        ]
+        
+        for pattern in patterns:
+            match = re.search(pattern, qname)
+            if match:
+                return match.group(1)
+        
+        return None
+    
+    def extract_column_data(self, entity_details: Dict) -> List[Dict]:
+        """Extract column information from entity details."""
+        columns_data = []
+        
+        if not entity_details:
+            return columns_data
+        
+        entity = entity_details.get("entity", {})
+        attributes = entity.get("attributes", {})
+        relationship_attrs = entity.get("relationshipAttributes", {})
+        
+        # Get basic entity info
+        entity_guid = entity.get("guid")
+        entity_type = entity.get("typeName", "")
+        entity_status = entity.get("status", "ACTIVE")
+        collection_id = entity.get("collectionId")
+        qname = attributes.get("qualifiedName", "")
+        table_name = attributes.get("name", "")
+        create_time = entity.get("createTime")
+        update_time = entity.get("updateTime")
+        
+        # Get datasource info
+        ds_info = self.extract_datasource_info(entity, entity_type)
+        
+        # Parse app_id
+        app_id = self.parse_app_id_from_qname(qname)
+        
+        # Get columns
+        columns = (relationship_attrs.get("columns", []) or 
+                  relationship_attrs.get("schema", []))
+        
+        if not columns and "referredEntities" in entity_details:
+            referred = entity_details.get("referredEntities", {})
+            for ref_guid, ref_entity in referred.items():
+                type_name = ref_entity.get("typeName", "")
+                if "column" in type_name.lower():
+                    columns.append(ref_entity)
+        
+        # Extract column details
+        for column in columns:
+            if isinstance(column, dict):
+                col_guid = column.get("guid")
+                col_attrs = column.get("attributes", {})
+                col_name = (column.get("displayText") or 
+                           col_attrs.get("name") or
+                           column.get("name"))
+                
+                classifications = column.get("classifications", [])
+                security_classification = None
+                if classifications:
+                    security_classification = classifications[0].get("typeName")
+                
+                column_data = {
+                    "collection_id": collection_id,
+                    "entity_type": entity_type,
+                    "datasource_name": ds_info["datasource_name"],
+                    "schema_name": ds_info["schema_name"],
+                    "app_id": app_id,
+                    "asset_id": entity_guid,
+                    "table_name": table_name,
+                    "column_guid": col_guid,
+                    "column_name": col_name,
+                    "data_type": col_attrs.get("dataType") or col_attrs.get("type"),
+                    "column_desc": (col_attrs.get("description") or 
+                                   col_attrs.get("userDescription") or
+                                   col_attrs.get("comment")),
+                    "security_classification": security_classification,
+                    "entity_status": entity_status,
+                    "create_time": create_time,
+                    "update_time": update_time,
+                    "last_modified_ts": datetime.now().isoformat()
+                }
+                
+                columns_data.append(column_data)
+        
+        # If no columns found, return entity-level info
+        if not columns_data:
+            column_data = {
+                "collection_id": collection_id,
+                "entity_type": entity_type,
+                "datasource_name": ds_info["datasource_name"],
+                "schema_name": ds_info["schema_name"],
+                "app_id": app_id,
+                "asset_id": entity_guid,
+                "table_name": table_name,
+                "column_guid": None,
+                "column_name": None,
+                "data_type": None,
+                "column_desc": None,
+                "security_classification": None,
+                "entity_status": entity_status,
+                "create_time": create_time,
+                "update_time": update_time,
+                "last_modified_ts": datetime.now().isoformat()
+            }
+            columns_data.append(column_data)
+        
+        return columns_data
+    
+    def extract_all_data(self) -> pd.DataFrame:
+        """
+        Extract all data from Purview and return as DataFrame.
+        
+        Returns:
+            Pandas DataFrame with all extracted data
+        """
+        logger.info("Starting data extraction from Azure Purview...")
+        
+        # Test endpoints first
+        endpoint_status = self.test_endpoints()
+        
+        # Try query API first, fall back to Atlas basic search
+        entities = self.search_entities_query_api()
+        
+        if not entities:
+            logger.info("Query API not available, using Atlas basic search...")
+            entities = self.search_entities_atlas_basic()
+        
+        if not entities:
+            logger.warning("No entities found!")
+            return pd.DataFrame()
+        
+        all_data = []
+        
+        for idx, entity in enumerate(entities, 1):
+            guid = entity.get("id") or entity.get("guid")
+            entity_type = entity.get("entityType") or entity.get("typeName")
+            
+            logger.info(f"Processing entity {idx}/{len(entities)}: {guid}")
+            
+            entity_details = self.get_entity_details(guid)
+            
+            if entity_details:
+                columns_data = self.extract_column_data(entity_details)
+                all_data.extend(columns_data)
+            
+            if idx % 10 == 0:
+                time.sleep(1)
+        
+        logger.info(f"Extracted {len(all_data)} records")
+        
+        df = pd.DataFrame(all_data)
+        return df
+    
+    def write_to_adls(self, df: pd.DataFrame, storage_account: str, 
+                      container: str, file_path: str, 
+                      storage_key: str = None, sas_token: str = None):
+        """Write DataFrame to Azure Data Lake Storage."""
+        logger.info(f"Writing data to ADLS: {storage_account}/{container}/{file_path}")
+        
+        try:
+            if storage_key:
+                service_client = DataLakeServiceClient(
+                    account_url=f"https://{storage_account}.dfs.core.windows.net",
+                    credential=storage_key
+                )
+            elif sas_token:
+                service_client = DataLakeServiceClient(
+                    account_url=f"https://{storage_account}.dfs.core.windows.net",
+                    credential=sas_token
+                )
+            else:
+                raise ValueError("Either storage_key or sas_token must be provided")
+            
+            file_system_client = service_client.get_file_system_client(file_system=container)
+            file_client = file_system_client.get_file_client(file_path)
+            
+            csv_data = df.to_csv(index=False)
+            file_client.upload_data(csv_data, overwrite=True)
+            
+            logger.info(f"✓ Successfully wrote {len(df)} records to ADLS")
+        except Exception as e:
+            logger.error(f"Failed to write to ADLS: {str(e)}")
+            raise
+
+
+def main():
+    """Main execution function."""
+    
+    config = {
+        "purview_account_name": "YOUR_PURVIEW_ACCOUNT_NAME",
+        "tenant_id": "YOUR_TENANT_ID",
+        "client_id": "YOUR_CLIENT_ID",
+        "client_secret": "YOUR_CLIENT_SECRET",
+        "adls_storage_account": "YOUR_ADLS_STORAGE_ACCOUNT",
+        "adls_container": "YOUR_CONTAINER_NAME",
+        "adls_file_path": f"purview_data/extract_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+        "adls_storage_key": "YOUR_STORAGE_KEY",
+        "debug_mode": True
+    }
+    
+    try:
+        extractor = AzurePurviewExtractor(
+            account_name=config["purview_account_name"],
+            tenant_id=config["tenant_id"],
+            client_id=config["client_id"],
+            client_secret=config["client_secret"],
+            debug=config.get("debug_mode", False)
+        )
+        
+        extractor.authenticate()
+        
+        df = extractor.extract_all_data()
+        
+        if df.empty:
+            logger.warning("No data extracted")
+            return None
+        
+        logger.info(f"\nDataFrame shape: {df.shape}")
+        logger.info(f"\nFirst few rows:")
+        print(df.head())
+        logger.info(f"\nColumns: {df.columns.tolist()}")
+        
+        extractor.write_to_adls(
+            df=df,
+            storage_account=config["adls_storage_account"],
+            container=config["adls_container"],
+            file_path=config["adls_file_path"],
+            storage_key=config.get("adls_storage_key"),
+            sas_token=config.get("adls_sas_token")
+        )
+        
+        logger.info("\n✓ Process completed successfully!")
+        
+        return df
+        
+    except Exception as e:
+        logger.error(f"Error occurred: {str(e)}", exc_info=True)
+        raise
+
+
+if __name__ == "__main__":
+    df = main()
