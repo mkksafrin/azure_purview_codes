@@ -1,0 +1,461 @@
+"""
+Azure Purview Data Extractor
+Connects to Azure Purview API, extracts entity metadata, and writes to ADLS
+"""
+
+import requests
+import pandas as pd
+from msal import ConfidentialClientApplication
+from azure.storage.filedatalake import DataLakeServiceClient
+from azure.identity import ClientSecretCredential
+import json
+from typing import List, Dict, Any
+import time
+
+
+class PurviewDataExtractor:
+    """Extract metadata from Azure Purview and write to ADLS"""
+    
+    def __init__(self, account_name: str, tenant_id: str, client_id: str, client_secret: str):
+        """
+        Initialize the Purview Data Extractor
+        
+        Args:
+            account_name: Azure Purview account name
+            tenant_id: Azure AD tenant ID
+            client_id: Service principal client ID
+            client_secret: Service principal client secret
+        """
+        self.account_name = account_name
+        self.tenant_id = tenant_id
+        self.client_id = client_id
+        self.client_secret = client_secret
+        self.base_url = f"https://{account_name}.purview.azure.com"
+        self.access_token = None
+        
+    def authenticate(self) -> str:
+        """
+        Authenticate using MSAL and get access token
+        
+        Returns:
+            Access token for API calls
+        """
+        authority = f"https://login.microsoftonline.com/{self.tenant_id}"
+        scope = ["https://purview.azure.net/.default"]
+        
+        app = ConfidentialClientApplication(
+            client_id=self.client_id,
+            client_credential=self.client_secret,
+            authority=authority
+        )
+        
+        result = app.acquire_token_for_client(scopes=scope)
+        
+        if "access_token" in result:
+            self.access_token = result["access_token"]
+            print("✓ Authentication successful")
+            return self.access_token
+        else:
+            raise Exception(f"Authentication failed: {result.get('error_description', 'Unknown error')}")
+    
+    def get_headers(self) -> Dict[str, str]:
+        """Get headers for API requests"""
+        if not self.access_token:
+            self.authenticate()
+        
+        return {
+            "Authorization": f"Bearer {self.access_token}",
+            "Content-Type": "application/json"
+        }
+    
+    def search_entities(self, search_query: Dict[str, Any] = None) -> List[str]:
+        """
+        Search for entities and return their IDs with pagination support
+        
+        Args:
+            search_query: Custom search query (optional)
+            
+        Returns:
+            List of entity IDs
+        """
+        url = f"{self.base_url}/catalog/api/search/query?api-version=2022-08-01-preview"
+        
+        # Default search query to get all entities
+        if search_query is None:
+            search_query = {
+                "keywords": "*",
+                "limit": 1000,
+                "offset": 0
+            }
+        
+        entity_ids = []
+        offset = 0
+        limit = search_query.get("limit", 1000)
+        
+        print("Searching for entities...")
+        
+        while True:
+            search_query["offset"] = offset
+            search_query["limit"] = limit
+            
+            response = requests.post(url, headers=self.get_headers(), json=search_query)
+            response.raise_for_status()
+            
+            data = response.json()
+            
+            # Extract IDs from search results
+            if "value" in data:
+                batch_ids = [item.get("id") for item in data["value"] if item.get("id")]
+                entity_ids.extend(batch_ids)
+                print(f"  Found {len(batch_ids)} entities (Total: {len(entity_ids)})")
+                
+                # Check if there are more results
+                if len(batch_ids) < limit:
+                    break
+                
+                offset += limit
+                time.sleep(0.5)  # Rate limiting
+            else:
+                break
+        
+        print(f"✓ Total entities found: {len(entity_ids)}")
+        return entity_ids
+    
+    def get_entity_bulk(self, guids: List[str]) -> Dict[str, Any]:
+        """
+        Get entities in bulk using GUIDs
+        
+        Args:
+            guids: List of entity GUIDs
+            
+        Returns:
+            Bulk entity response
+        """
+        url = f"{self.base_url}/catalog/api/atlas/v2/entity/bulk"
+        
+        # Atlas bulk API expects guid parameter
+        params = {"guid": guids}
+        
+        response = requests.get(url, headers=self.get_headers(), params=params)
+        response.raise_for_status()
+        
+        return response.json()
+    
+    def extract_schema_guids(self, entity_data: Dict[str, Any]) -> List[str]:
+        """
+        Extract schema GUIDs from entity relationshipAttributes
+        
+        Args:
+            entity_data: Entity bulk response
+            
+        Returns:
+            List of schema GUIDs
+        """
+        schema_guids = []
+        
+        if "entities" in entity_data:
+            for entity in entity_data["entities"]:
+                if "relationshipAttributes" in entity:
+                    rel_attrs = entity["relationshipAttributes"]
+                    
+                    # Check for attachedSchema
+                    if "attachedSchema" in rel_attrs:
+                        attached_schema = rel_attrs["attachedSchema"]
+                        
+                        # Handle both single object and list
+                        if isinstance(attached_schema, list):
+                            for schema in attached_schema:
+                                if isinstance(schema, dict) and "guid" in schema:
+                                    schema_guids.append(schema["guid"])
+                        elif isinstance(attached_schema, dict) and "guid" in attached_schema:
+                            schema_guids.append(attached_schema["guid"])
+        
+        return schema_guids
+    
+    def extract_metadata(self, entity_data: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """
+        Extract required metadata from entity bulk response
+        
+        Args:
+            entity_data: Entity bulk response
+            
+        Returns:
+            List of extracted metadata records
+        """
+        records = []
+        
+        entities = entity_data.get("entities", [])
+        referred_entities = entity_data.get("referredEntities", {})
+        
+        for entity in entities:
+            # Get table-level info
+            table_asset_id = entity.get("guid")
+            collection_id = entity.get("collectionId")
+            create_time = entity.get("createTime")
+            update_time = entity.get("updateTime")
+            entity_status = entity.get("status")
+            last_modified_ts = entity.get("lastModifiedTS")
+            
+            # Get related datasets
+            entity_type = None
+            if "relationshipAttributes" in entity:
+                related_datasets = entity.get("relationshipAttributes", {}).get("relatedDataSets", [])
+                if related_datasets:
+                    if isinstance(related_datasets, list) and len(related_datasets) > 0:
+                        entity_type = related_datasets[0].get("typeName")
+                    elif isinstance(related_datasets, dict):
+                        entity_type = related_datasets.get("typeName")
+            
+            # Get classifications
+            classifications = entity.get("classifications", [])
+            classification = None
+            if classifications and len(classifications) > 0:
+                classification = classifications[0].get("typeName")
+            
+            # Get columns from relationshipAttributes
+            columns = []
+            if "relationshipAttributes" in entity:
+                rel_attrs = entity["relationshipAttributes"]
+                
+                # Common column attribute names in Purview
+                column_attrs = ["columns", "schema", "attachedSchema", "attributes"]
+                
+                for attr_name in column_attrs:
+                    if attr_name in rel_attrs:
+                        col_data = rel_attrs[attr_name]
+                        if isinstance(col_data, list):
+                            columns.extend(col_data)
+                        elif isinstance(col_data, dict):
+                            columns.append(col_data)
+            
+            # Process each column
+            if columns:
+                for column in columns:
+                    if isinstance(column, dict):
+                        column_guid = column.get("guid")
+                        
+                        # Get column details from referredEntities
+                        if column_guid and column_guid in referred_entities:
+                            referred_entity = referred_entities[column_guid]
+                            
+                            attributes = referred_entity.get("attributes", {})
+                            
+                            record = {
+                                "table_asset_id": table_asset_id,
+                                "column_guid": column_guid,
+                                "collectionId": collection_id,
+                                "entity_type": entity_type,
+                                "col_name": attributes.get("name"),
+                                "data_type": attributes.get("type") or attributes.get("dataType"),
+                                "desc": attributes.get("userDescription"),
+                                "qName": attributes.get("qualifiedName"),
+                                "classification": classification,
+                                "createTime": create_time,
+                                "updateTime": update_time,
+                                "entityStatus": entity_status,
+                                "lastModifiedTS": last_modified_ts
+                            }
+                            
+                            records.append(record)
+                        else:
+                            # Column GUID not in referred entities, add basic info
+                            record = {
+                                "table_asset_id": table_asset_id,
+                                "column_guid": column_guid,
+                                "collectionId": collection_id,
+                                "entity_type": entity_type,
+                                "col_name": column.get("displayName"),
+                                "data_type": None,
+                                "desc": None,
+                                "qName": None,
+                                "classification": classification,
+                                "createTime": create_time,
+                                "updateTime": update_time,
+                                "entityStatus": entity_status,
+                                "lastModifiedTS": last_modified_ts
+                            }
+                            records.append(record)
+            else:
+                # No columns found, add table-level record
+                record = {
+                    "table_asset_id": table_asset_id,
+                    "column_guid": None,
+                    "collectionId": collection_id,
+                    "entity_type": entity_type,
+                    "col_name": None,
+                    "data_type": None,
+                    "desc": None,
+                    "qName": entity.get("attributes", {}).get("qualifiedName"),
+                    "classification": classification,
+                    "createTime": create_time,
+                    "updateTime": update_time,
+                    "entityStatus": entity_status,
+                    "lastModifiedTS": last_modified_ts
+                }
+                records.append(record)
+        
+        return records
+    
+    def process_all_entities(self, batch_size: int = 100) -> pd.DataFrame:
+        """
+        Process all entities with pagination and return DataFrame
+        
+        Args:
+            batch_size: Number of GUIDs to process in each bulk API call
+            
+        Returns:
+            DataFrame with extracted metadata
+        """
+        # Step 1: Search for all entity IDs
+        entity_ids = self.search_entities()
+        
+        if not entity_ids:
+            print("No entities found")
+            return pd.DataFrame()
+        
+        all_records = []
+        
+        # Step 2: Process entities in batches
+        print(f"\nProcessing {len(entity_ids)} entities in batches of {batch_size}...")
+        
+        for i in range(0, len(entity_ids), batch_size):
+            batch_ids = entity_ids[i:i + batch_size]
+            print(f"  Processing batch {i // batch_size + 1} ({len(batch_ids)} entities)...")
+            
+            try:
+                # Get entity details
+                entity_data = self.get_entity_bulk(batch_ids)
+                
+                # Extract schema GUIDs if needed
+                schema_guids = self.extract_schema_guids(entity_data)
+                
+                # If schema GUIDs found, fetch them too
+                if schema_guids:
+                    print(f"    Found {len(schema_guids)} schema entities, fetching details...")
+                    schema_data = self.get_entity_bulk(schema_guids)
+                    
+                    # Merge schema data into main entity data
+                    if "entities" in schema_data:
+                        entity_data.setdefault("entities", []).extend(schema_data.get("entities", []))
+                    if "referredEntities" in schema_data:
+                        entity_data.setdefault("referredEntities", {}).update(schema_data.get("referredEntities", {}))
+                
+                # Extract metadata
+                records = self.extract_metadata(entity_data)
+                all_records.extend(records)
+                print(f"    Extracted {len(records)} records")
+                
+                time.sleep(0.5)  # Rate limiting
+                
+            except Exception as e:
+                print(f"    Error processing batch: {str(e)}")
+                continue
+        
+        # Step 3: Create DataFrame
+        df = pd.DataFrame(all_records)
+        print(f"\n✓ Total records extracted: {len(df)}")
+        
+        return df
+    
+    def write_to_adls(self, df: pd.DataFrame, adls_account: str, container: str, 
+                      file_path: str, credential: ClientSecretCredential = None) -> None:
+        """
+        Write DataFrame to Azure Data Lake Storage
+        
+        Args:
+            df: DataFrame to write
+            adls_account: ADLS account name
+            container: Container/filesystem name
+            file_path: Path within container (e.g., 'folder/file.csv')
+            credential: Azure credential (if None, uses service principal from init)
+        """
+        print(f"\nWriting to ADLS: {adls_account}/{container}/{file_path}")
+        
+        # Use service principal credentials if not provided
+        if credential is None:
+            credential = ClientSecretCredential(
+                tenant_id=self.tenant_id,
+                client_id=self.client_id,
+                client_secret=self.client_secret
+            )
+        
+        # Create DataLake service client
+        service_client = DataLakeServiceClient(
+            account_url=f"https://{adls_account}.dfs.core.windows.net",
+            credential=credential
+        )
+        
+        # Get file system client
+        file_system_client = service_client.get_file_system_client(file_system=container)
+        
+        # Get file client
+        file_client = file_system_client.get_file_client(file_path)
+        
+        # Convert DataFrame to CSV
+        csv_data = df.to_csv(index=False)
+        
+        # Upload file
+        file_client.upload_data(csv_data, overwrite=True)
+        
+        print(f"✓ Successfully wrote {len(df)} rows to ADLS")
+        print(f"  Location: abfss://{container}@{adls_account}.dfs.core.windows.net/{file_path}")
+
+
+def main():
+    """Main execution function"""
+    
+    # Configuration
+    ACCOUNT_NAME = "your-purview-account"
+    TENANT_ID = "your-tenant-id"
+    CLIENT_ID = "your-client-id"
+    CLIENT_SECRET = "your-client-secret"
+    
+    # ADLS Configuration
+    ADLS_ACCOUNT = "your-adls-account"
+    ADLS_CONTAINER = "your-container"
+    ADLS_FILE_PATH = "purview/metadata/entity_metadata.csv"
+    
+    try:
+        # Initialize extractor
+        extractor = PurviewDataExtractor(
+            account_name=ACCOUNT_NAME,
+            tenant_id=TENANT_ID,
+            client_id=CLIENT_ID,
+            client_secret=CLIENT_SECRET
+        )
+        
+        # Authenticate
+        extractor.authenticate()
+        
+        # Process all entities
+        df = extractor.process_all_entities(batch_size=100)
+        
+        if not df.empty:
+            # Display sample data
+            print("\nSample data:")
+            print(df.head())
+            print(f"\nDataFrame shape: {df.shape}")
+            print(f"Columns: {list(df.columns)}")
+            
+            # Write to ADLS
+            extractor.write_to_adls(
+                df=df,
+                adls_account=ADLS_ACCOUNT,
+                container=ADLS_CONTAINER,
+                file_path=ADLS_FILE_PATH
+            )
+            
+            # Optional: Save locally as well
+            local_file = "/home/claude/purview_metadata.csv"
+            df.to_csv(local_file, index=False)
+            print(f"\n✓ Also saved locally to: {local_file}")
+        else:
+            print("No data extracted")
+            
+    except Exception as e:
+        print(f"\n✗ Error: {str(e)}")
+        raise
+
+
+if __name__ == "__main__":
+    main()
