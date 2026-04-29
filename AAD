@@ -1,0 +1,246 @@
+"""
+Azure Active Directory - Group Members Fetcher
+===============================================
+Fetches members of an AAD group by group name using Microsoft Graph API.
+
+Requirements:
+    pip install msal requests tabulate
+
+Azure App Registration Setup:
+    1. Go to Azure Portal → Azure Active Directory → App registrations → New registration
+    2. Note down: Tenant ID, Client ID
+    3. Go to Certificates & secrets → New client secret → Note down the secret value
+    4. Go to API permissions → Add permission → Microsoft Graph → Application permissions:
+        - Group.Read.All
+        - GroupMember.Read.All
+        - User.Read.All
+        - Application.Read.All   (to resolve service principals)
+    5. Click "Grant admin consent"
+"""
+
+import os
+import sys
+import json
+import argparse
+import requests
+from tabulate import tabulate
+
+try:
+    import msal
+except ImportError:
+    print("ERROR: 'msal' package not found. Install with: pip install msal requests tabulate")
+    sys.exit(1)
+
+
+# ──────────────────────────────────────────────
+# Configuration — set via env vars or edit here
+# ──────────────────────────────────────────────
+TENANT_ID     = os.getenv("AZURE_TENANT_ID",     "<YOUR_TENANT_ID>")
+CLIENT_ID     = os.getenv("AZURE_CLIENT_ID",     "<YOUR_CLIENT_ID>")
+CLIENT_SECRET = os.getenv("AZURE_CLIENT_SECRET", "<YOUR_CLIENT_SECRET>")
+
+GRAPH_BASE    = "https://graph.microsoft.com/v1.0"
+GRAPH_SCOPE   = ["https://graph.microsoft.com/.default"]
+
+
+# ──────────────────────────────────────────────
+# Auth
+# ──────────────────────────────────────────────
+def get_access_token() -> str:
+    """Acquire an OAuth2 token via client credentials flow."""
+    authority = f"https://login.microsoftonline.com/{TENANT_ID}"
+    app = msal.ConfidentialClientApplication(
+        CLIENT_ID,
+        authority=authority,
+        client_credential=CLIENT_SECRET,
+    )
+    result = app.acquire_token_for_client(scopes=GRAPH_SCOPE)
+    if "access_token" not in result:
+        error = result.get("error_description", result.get("error", "Unknown error"))
+        raise RuntimeError(f"Failed to acquire token: {error}")
+    return result["access_token"]
+
+
+# ──────────────────────────────────────────────
+# Graph API helpers
+# ──────────────────────────────────────────────
+def graph_get(token: str, url: str) -> dict:
+    """GET request against the Graph API with automatic pagination handling."""
+    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+    all_values = []
+
+    while url:
+        resp = requests.get(url, headers=headers, timeout=30)
+        resp.raise_for_status()
+        data = resp.json()
+        all_values.extend(data.get("value", [data]))   # single-object endpoints have no "value"
+        url = data.get("@odata.nextLink")               # follow pagination
+
+    # If original response was a single object (no "value"), return it directly
+    return all_values if len(all_values) > 1 or isinstance(all_values[0], dict) and "value" not in all_values[0] else all_values
+
+
+def find_group_by_name(token: str, group_name: str) -> dict:
+    """Look up a group by its displayName (exact match)."""
+    encoded = group_name.replace("'", "''")   # escape single quotes for OData filter
+    url = f"{GRAPH_BASE}/groups?$filter=displayName eq '{encoded}'&$select=id,displayName,description,mail"
+    results = graph_get(token, url)
+    if not results:
+        raise ValueError(f"No group found with displayName: '{group_name}'")
+    if len(results) > 1:
+        print(f"⚠  Multiple groups matched '{group_name}'. Using the first result.")
+    return results[0]
+
+
+def get_group_members(token: str, group_id: str) -> list[dict]:
+    """
+    Fetch direct members of a group.
+    Supports Users, Groups (nested), Service Principals, Devices, Contacts.
+    """
+    url = (
+        f"{GRAPH_BASE}/groups/{group_id}/members"
+        "?$select=id,displayName,mail,userPrincipalName,jobTitle,"
+        "department,accountEnabled,@odata.type"
+    )
+    return graph_get(token, url)
+
+
+# ──────────────────────────────────────────────
+# Member normalisation
+# ──────────────────────────────────────────────
+OData_TYPE_MAP = {
+    "#microsoft.graph.user":             "User",
+    "#microsoft.graph.group":            "Group",
+    "#microsoft.graph.servicePrincipal": "Service Principal",
+    "#microsoft.graph.device":           "Device",
+    "#microsoft.graph.orgContact":       "Contact",
+}
+
+def normalise_member(member: dict) -> dict:
+    """Flatten a raw Graph member object into a clean dict."""
+    raw_type = member.get("@odata.type", "")
+    member_type = OData_TYPE_MAP.get(raw_type, raw_type.split(".")[-1])
+
+    email = (
+        member.get("mail")
+        or member.get("userPrincipalName")
+        or "—"
+    )
+
+    return {
+        "Object ID":    member.get("id", "—"),
+        "Display Name": member.get("displayName", "—"),
+        "Type":         member_type,
+        "Email":        email,
+        "Job Title":    member.get("jobTitle") or "—",
+        "Department":   member.get("department") or "—",
+        "Account Enabled": (
+            str(member["accountEnabled"])
+            if "accountEnabled" in member
+            else "N/A"
+        ),
+    }
+
+
+# ──────────────────────────────────────────────
+# Output helpers
+# ──────────────────────────────────────────────
+def print_table(members: list[dict]) -> None:
+    if not members:
+        print("  (no members found)")
+        return
+    print(tabulate(members, headers="keys", tablefmt="rounded_outline"))
+
+
+def save_json(members: list[dict], path: str) -> None:
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump(members, fh, indent=2, ensure_ascii=False)
+    print(f"\n✅  JSON saved → {path}")
+
+
+def save_csv(members: list[dict], path: str) -> None:
+    import csv
+    if not members:
+        return
+    with open(path, "w", newline="", encoding="utf-8") as fh:
+        writer = csv.DictWriter(fh, fieldnames=members[0].keys())
+        writer.writeheader()
+        writer.writerows(members)
+    print(f"✅  CSV  saved → {path}")
+
+
+# ──────────────────────────────────────────────
+# Main
+# ──────────────────────────────────────────────
+def main():
+    parser = argparse.ArgumentParser(
+        description="Fetch Azure AD group members via Microsoft Graph API"
+    )
+    parser.add_argument(
+        "group_name",
+        nargs="?",
+        help="Display name of the AAD group (wrap in quotes if it contains spaces)",
+    )
+    parser.add_argument("--json",  metavar="FILE", help="Also save results as JSON")
+    parser.add_argument("--csv",   metavar="FILE", help="Also save results as CSV")
+    parser.add_argument("--quiet", action="store_true", help="Suppress table output")
+    args = parser.parse_args()
+
+    # Prompt interactively if not supplied on command line
+    group_name = args.group_name or input("Enter AAD group name: ").strip()
+    if not group_name:
+        print("ERROR: Group name cannot be empty.")
+        sys.exit(1)
+
+    # Validate credentials are configured
+    placeholders = {"<YOUR_TENANT_ID>", "<YOUR_CLIENT_ID>", "<YOUR_CLIENT_SECRET>"}
+    missing = [k for k, v in [("TENANT_ID", TENANT_ID), ("CLIENT_ID", CLIENT_ID), ("CLIENT_SECRET", CLIENT_SECRET)] if v in placeholders]
+    if missing:
+        print(
+            "ERROR: The following credentials are not configured:\n"
+            + "\n".join(f"  • {m}" % m for m in missing)
+            + "\n\nSet them as environment variables or edit the script directly:\n"
+            "  export AZURE_TENANT_ID='...'\n"
+            "  export AZURE_CLIENT_ID='...'\n"
+            "  export AZURE_CLIENT_SECRET='...'\n"
+        )
+        sys.exit(1)
+
+    print(f"\n🔐  Authenticating with Azure AD (tenant: {TENANT_ID[:8]}…)…")
+    token = get_access_token()
+    print("✅  Token acquired.\n")
+
+    print(f"🔍  Searching for group: \"{group_name}\"…")
+    group = find_group_by_name(token, group_name)
+    print(f"✅  Found group  →  ID: {group['id']}")
+    if group.get("description"):
+        print(f"    Description : {group['description']}")
+    if group.get("mail"):
+        print(f"    Mail        : {group['mail']}")
+    print()
+
+    print("👥  Fetching members…")
+    raw_members = get_group_members(token, group["id"])
+    members = [normalise_member(m) for m in raw_members]
+    print(f"✅  {len(members)} member(s) found.\n")
+
+    if not args.quiet:
+        print_table(members)
+
+    if args.json:
+        save_json(members, args.json)
+    if args.csv:
+        save_csv(members, args.csv)
+
+    # Summary by type
+    if members:
+        print("\n📊  Member type breakdown:")
+        from collections import Counter
+        for mtype, count in Counter(m["Type"] for m in members).most_common():
+            print(f"    {mtype:<25} {count}")
+
+    print()
+
+
+if __name__ == "__main__":
+    main()
