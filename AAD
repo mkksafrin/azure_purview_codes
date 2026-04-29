@@ -3,6 +3,16 @@ Azure Active Directory - Group Members Fetcher
 ===============================================
 Fetches members of an AAD group by group name using Microsoft Graph API.
 
+CSV output format (one row per group):
+  Each field for all members is semicolon-separated within a single cell.
+
+  Example (group with 3 members):
+  ┌─────────────────┬────────────────────────────────┬──────────────────┐
+  │ Group Name      │ Display Name                   │ Email            │
+  ├─────────────────┼────────────────────────────────┼──────────────────┤
+  │ My AAD Group    │ Alice;Bob;Charlie              │ a@x.com;b@x.com  │
+  └─────────────────┴────────────────────────────────┴──────────────────┘
+
 Requirements:
     pip install msal requests tabulate
 
@@ -20,6 +30,7 @@ Azure App Registration Setup:
 
 import os
 import sys
+import csv
 import json
 import argparse
 import requests
@@ -145,7 +156,49 @@ def normalise_member(member: dict) -> dict:
 # ──────────────────────────────────────────────
 # Output helpers
 # ──────────────────────────────────────────────
+MEMBER_FIELDS = [
+    "Object ID",
+    "Display Name",
+    "Type",
+    "Email",
+    "Job Title",
+    "Department",
+    "Account Enabled",
+]
+
+CSV_COLUMNS = ["Group Name", "Group Mail", "Member Count"] + MEMBER_FIELDS
+
+
+def collapse_members(group: dict, members: list[dict]) -> dict:
+    """
+    Collapse all members of a group into a single CSV row.
+    Each member field becomes a semicolon-separated string of all members' values.
+
+    Example with 2 members:
+        Display Name  → "Alice;Bob"
+        Email         → "alice@x.com;bob@x.com"
+        Type          → "User;User"
+    """
+    row = {
+        "Group Name":   group.get("displayName", "—"),
+        "Group Mail":   group.get("mail") or "—",
+        "Member Count": len(members),
+    }
+
+    if not members:
+        for field in MEMBER_FIELDS:
+            row[field] = "—"
+        return row
+
+    for field in MEMBER_FIELDS:
+        # Collect every member's value for this field, then join with ";"
+        row[field] = ";".join(str(m.get(field, "—")) for m in members)
+
+    return row
+
+
 def print_table(members: list[dict]) -> None:
+    """Pretty-print individual members (terminal preview)."""
     if not members:
         print("  (no members found)")
         return
@@ -158,15 +211,22 @@ def save_json(members: list[dict], path: str) -> None:
     print(f"\n✅  JSON saved → {path}")
 
 
-def save_csv(members: list[dict], path: str) -> None:
-    import csv
-    if not members:
+def save_csv(rows: list[dict], path: str) -> None:
+    """
+    Write collapsed group rows to CSV.
+    Each row = one group; multi-member fields are semicolon-separated within a cell.
+    """
+    if not rows:
+        print("⚠  No data to write.")
         return
-    with open(path, "w", newline="", encoding="utf-8") as fh:
-        writer = csv.DictWriter(fh, fieldnames=members[0].keys())
+
+    with open(path, "w", newline="", encoding="utf-8-sig") as fh:   # utf-8-sig for Excel compat
+        writer = csv.DictWriter(fh, fieldnames=CSV_COLUMNS, extrasaction="ignore")
         writer.writeheader()
-        writer.writerows(members)
-    print(f"✅  CSV  saved → {path}")
+        writer.writerows(rows)
+
+    print(f"✅  CSV saved → {path}")
+    print(f"    Rows written : {len(rows)}  (1 row per group, fields separated by ';')")
 
 
 # ──────────────────────────────────────────────
@@ -174,32 +234,48 @@ def save_csv(members: list[dict], path: str) -> None:
 # ──────────────────────────────────────────────
 def main():
     parser = argparse.ArgumentParser(
-        description="Fetch Azure AD group members via Microsoft Graph API"
+        description="Fetch Azure AD group members via Microsoft Graph API",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  python aad_group_members.py "My Group"
+  python aad_group_members.py "Group A" "Group B" --output results.csv
+  python aad_group_members.py "My Group" --json members.json --quiet
+        """,
     )
     parser.add_argument(
-        "group_name",
-        nargs="?",
-        help="Display name of the AAD group (wrap in quotes if it contains spaces)",
+        "group_names",
+        nargs="*",
+        metavar="GROUP_NAME",
+        help="One or more AAD group display names (wrap in quotes if they contain spaces)",
     )
-    parser.add_argument("--json",  metavar="FILE", help="Also save results as JSON")
-    parser.add_argument("--csv",   metavar="FILE", help="Also save results as CSV")
-    parser.add_argument("--quiet", action="store_true", help="Suppress table output")
+    parser.add_argument(
+        "--output", "-o",
+        metavar="FILE",
+        default="aad_group_members.csv",
+        help="CSV output file path (default: aad_group_members.csv)",
+    )
+    parser.add_argument("--json",  metavar="FILE", help="Also save full member detail as JSON")
+    parser.add_argument("--quiet", action="store_true", help="Suppress per-member table output")
     args = parser.parse_args()
 
-    # Prompt interactively if not supplied on command line
-    group_name = args.group_name or input("Enter AAD group name: ").strip()
-    if not group_name:
-        print("ERROR: Group name cannot be empty.")
+    # Collect group names — from args or interactive prompt
+    group_names = args.group_names
+    if not group_names:
+        raw = input("Enter AAD group name(s), comma-separated: ").strip()
+        group_names = [g.strip() for g in raw.split(",") if g.strip()]
+    if not group_names:
+        print("ERROR: At least one group name is required.")
         sys.exit(1)
 
-    # Validate credentials are configured
+    # Validate credentials
     placeholders = {"<YOUR_TENANT_ID>", "<YOUR_CLIENT_ID>", "<YOUR_CLIENT_SECRET>"}
     missing = [k for k, v in [("TENANT_ID", TENANT_ID), ("CLIENT_ID", CLIENT_ID), ("CLIENT_SECRET", CLIENT_SECRET)] if v in placeholders]
     if missing:
         print(
             "ERROR: The following credentials are not configured:\n"
-            + "\n".join(f"  • {m}" % m for m in missing)
-            + "\n\nSet them as environment variables or edit the script directly:\n"
+            + "\n".join(f"  • {m}" for m in missing)
+            + "\n\nSet them as environment variables:\n"
             "  export AZURE_TENANT_ID='...'\n"
             "  export AZURE_CLIENT_ID='...'\n"
             "  export AZURE_CLIENT_SECRET='...'\n"
@@ -210,36 +286,53 @@ def main():
     token = get_access_token()
     print("✅  Token acquired.\n")
 
-    print(f"🔍  Searching for group: \"{group_name}\"…")
-    group = find_group_by_name(token, group_name)
-    print(f"✅  Found group  →  ID: {group['id']}")
-    if group.get("description"):
-        print(f"    Description : {group['description']}")
-    if group.get("mail"):
-        print(f"    Mail        : {group['mail']}")
-    print()
+    csv_rows   = []   # one collapsed row per group
+    all_detail = {}   # group_name → list of member dicts (for JSON export)
 
-    print("👥  Fetching members…")
-    raw_members = get_group_members(token, group["id"])
-    members = [normalise_member(m) for m in raw_members]
-    print(f"✅  {len(members)} member(s) found.\n")
+    for group_name in group_names:
+        print(f"🔍  Searching for group: \"{group_name}\"…")
+        try:
+            group = find_group_by_name(token, group_name)
+        except ValueError as exc:
+            print(f"⚠   {exc} — skipping.\n")
+            continue
 
-    if not args.quiet:
-        print_table(members)
+        print(f"✅  Found  →  ID: {group['id']}")
+        if group.get("description"):
+            print(f"    Description : {group['description']}")
+        if group.get("mail"):
+            print(f"    Mail        : {group['mail']}")
 
+        print("👥  Fetching members…")
+        raw_members = get_group_members(token, group["id"])
+        members     = [normalise_member(m) for m in raw_members]
+        print(f"✅  {len(members)} member(s) found.")
+
+        if not args.quiet:
+            print()
+            print_table(members)
+
+        # Collapse into one CSV row
+        csv_rows.append(collapse_members(group, members))
+        all_detail[group_name] = members
+
+        # Type summary
+        if members:
+            from collections import Counter
+            print("\n📊  Member type breakdown:")
+            for mtype, count in Counter(m["Type"] for m in members).most_common():
+                print(f"    {mtype:<25} {count}")
+        print()
+
+    # ── Always write CSV ──
+    print(f"\n💾  Writing CSV → {args.output}")
+    save_csv(csv_rows, args.output)
+
+    # ── Optionally write JSON ──
     if args.json:
-        save_json(members, args.json)
-    if args.csv:
-        save_csv(members, args.csv)
+        save_json(all_detail, args.json)
 
-    # Summary by type
-    if members:
-        print("\n📊  Member type breakdown:")
-        from collections import Counter
-        for mtype, count in Counter(m["Type"] for m in members).most_common():
-            print(f"    {mtype:<25} {count}")
-
-    print()
+    print("\nDone.\n")
 
 
 if __name__ == "__main__":
